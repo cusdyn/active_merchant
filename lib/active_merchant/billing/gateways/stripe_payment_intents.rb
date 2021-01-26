@@ -12,7 +12,7 @@ module ActiveMerchant #:nodoc:
       CREATE_INTENT_ATTRIBUTES = %i[description statement_descriptor_suffix statement_descriptor receipt_email save_payment_method]
       CONFIRM_INTENT_ATTRIBUTES = %i[receipt_email return_url save_payment_method setup_future_usage off_session]
       UPDATE_INTENT_ATTRIBUTES = %i[description statement_descriptor_suffix statement_descriptor receipt_email setup_future_usage]
-      DEFAULT_API_VERSION = '2019-05-16'
+      DEFAULT_API_VERSION = '2020-03-02'
 
       def create_intent(money, payment_method, options = {})
         post = {}
@@ -56,16 +56,19 @@ module ActiveMerchant #:nodoc:
       end
 
       def create_payment_method(payment_method, options = {})
-        post = {}
-        post[:type] = 'card'
-        post[:card] = {}
-        post[:card][:number] = payment_method.number
-        post[:card][:exp_month] = payment_method.month
-        post[:card][:exp_year] = payment_method.year
-        post[:card][:cvc] = payment_method.verification_value if payment_method.verification_value
-        add_billing_address(post, options)
+        post_data = {}
+        post_data[:type] = 'card'
+        post_data[:card] = {}
+        post_data[:card][:number] = payment_method.number
+        post_data[:card][:exp_month] = payment_method.month
+        post_data[:card][:exp_year] = payment_method.year
+        post_data[:card][:cvc] = payment_method.verification_value if payment_method.verification_value
+        add_billing_address(post_data, options)
+
         options = format_idempotency_key(options, 'pm')
-        commit(:post, 'payment_methods', post, options)
+        return commit(:post, 'payment_methods', post_data, options) unless off_session_request?(options)
+
+        post_data
       end
 
       def update_intent(money, intent_id, payment_method, options = {})
@@ -100,6 +103,12 @@ module ActiveMerchant #:nodoc:
         post[:description] = options[:description] if options[:description]
 
         commit(:post, 'setup_intents', post, options)
+      end
+
+      def retrieve_setup_intent(seti)
+        commit(:post, "setup_intents/#{seti}", {
+          'expand[]': 'latest_attempt'
+        }, {})
       end
 
       def authorize(money, payment_method, options = {})
@@ -194,6 +203,10 @@ module ActiveMerchant #:nodoc:
 
       private
 
+      def off_session_request?(options = {})
+        (options[:off_session] || options[:setup_future_usage]) && options[:confirm] == true
+      end
+
       def add_connected_account(post, options = {})
         super(post, options)
         post[:application_fee_amount] = options[:application_fee] if options[:application_fee]
@@ -234,15 +247,20 @@ module ActiveMerchant #:nodoc:
         return if payment_method.nil?
 
         if payment_method.is_a?(ActiveMerchant::Billing::CreditCard)
-          p = create_payment_method(payment_method, options)
-          return p unless p.success?
+          case p = create_payment_method(payment_method, options)
+          when ActiveMerchant::Billing::Response
+            return p unless p.success?
 
-          payment_method = p.params['id']
+            payment_method = p.params['id'] unless off_session_request?(options)
+          when Hash
+            post[:payment_method_data] = p if off_session_request?(options)
+          end
         end
 
-        if payment_method.is_a?(StripePaymentToken)
+        case payment_method
+        when StripePaymentToken
           post[:payment_method] = payment_method.payment_data['id']
-        elsif payment_method.is_a?(String)
+        when String
           if payment_method.include?('|')
             customer_id, payment_method_id = payment_method.split('|')
             token = payment_method_id
@@ -252,6 +270,8 @@ module ActiveMerchant #:nodoc:
           end
           post[:payment_method] = token
         end
+
+        return post
       end
 
       def add_payment_method_types(post, options)
@@ -268,6 +288,14 @@ module ActiveMerchant #:nodoc:
         post[:payment_method_options] ||= {}
         post[:payment_method_options][:card] ||= {}
         post[:payment_method_options][:card][:moto] = true if options[:moto]
+
+        if options[:mit]
+          mit = options[:mit]
+          post[:payment_method_options][:card][:mit_exemption] = {}
+          post[:payment_method_options][:card][:mit_exemption][:network_transaction_id] = options[:mit][:network_transaction_id] if mit[:network_transaction_id]
+          post[:payment_method_options][:card][:mit_exemption][:ds_transaction_id] = options[:mit][:ds_transaction_id] if mit[:ds_transaction_id]
+          post[:payment_method_options][:card][:mit_exemption][:claim_without_transaction_id] = options[:mit][:claim_without_transaction_id] if mit[:claim_without_transaction_id]
+        end
       end
 
       def add_error_on_requires_action(post, options = {})
@@ -295,11 +323,12 @@ module ActiveMerchant #:nodoc:
         post[:payment_method_options][:card][:three_d_secure][:electronic_commerce_indicator] = three_d_secure[:eci] if three_d_secure[:eci]
         post[:payment_method_options][:card][:three_d_secure][:cryptogram] = three_d_secure[:cavv] if three_d_secure[:cavv]
         post[:payment_method_options][:card][:three_d_secure][:transaction_id] = three_d_secure[:ds_transaction_id] || three_d_secure[:xid]
+        post
       end
 
       def setup_future_usage(post, options = {})
         post[:setup_future_usage] = options[:setup_future_usage] if %w(on_session off_session).include?(options[:setup_future_usage])
-        post[:off_session] = options[:off_session] if options[:off_session] && options[:confirm] == true
+        post[:off_session] = options[:off_session] if off_session_request?(options)
         post
       end
 

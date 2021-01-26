@@ -10,6 +10,15 @@ class RemoteStripeIntentsTest < Test::Unit::TestCase
     @declined_payment_method = 'pm_card_chargeDeclined'
     @three_ds_moto_enabled = 'pm_card_authenticationRequiredOnSetup'
     @three_ds_authentication_required = 'pm_card_authenticationRequired'
+    @three_ds_authentication_required_setup_for_off_session = 'pm_card_authenticationRequiredSetupForOffSession'
+    @three_ds_off_session_credit_card = credit_card('4000002500003155',
+      verification_value: '737',
+      month: 10,
+      year: 2022)
+    @three_ds_1_credit_card = credit_card('4000000000003063',
+      verification_value: '737',
+      month: 10,
+      year: 2021)
     @three_ds_credit_card = credit_card('4000000000003220',
       verification_value: '737',
       month: 10,
@@ -329,6 +338,154 @@ class RemoteStripeIntentsTest < Test::Unit::TestCase
 
     assert response = @gateway.authorize(@amount, @three_ds_credit_card, options)
     assert_failure response
+  end
+
+  def test_create_setup_intent_with_setup_future_usage
+    card_to_use = @three_ds_credit_card
+
+    assert authorize_response = @gateway.create_setup_intent(card_to_use, {
+      address: {
+        email: 'test@example.com',
+        name: 'John Doe',
+        line1: '1 Test Ln',
+        city: 'Durham',
+        tracking_number: '123456789'
+      },
+      currency: 'USD',
+      confirm: true,
+      execute_threed: true,
+      return_url: 'https://example.com'
+    })
+
+    p authorize_response
+    assert_equal 'requires_action', authorize_response.params['status']
+    assert_match 'https://hooks.stripe.com', authorize_response.params.dig('next_action', 'redirect_to_url', 'url')
+
+    seti = authorize_response.params['id']
+
+    assert si_reponse = @gateway.retrieve_setup_intent(seti)
+    assert_equal 'requires_action', si_reponse.params['status']
+    assert_nil si_reponse.params.dig('latest_attempt', 'payment_method_details', 'card', 'network_transaction_id')
+  end
+
+  def test_3ds_unauthenticated_authorize_with_off_session_requires_capture
+    card_to_use = @three_ds_off_session_credit_card
+
+    assert authorize_response = @gateway.authorize(@amount, card_to_use, {
+      address: {
+        email: 'test@example.com',
+        name: 'John Doe',
+        line1: '1 Test Ln',
+        city: 'Durham',
+        tracking_number: '123456789'
+      },
+      currency: 'USD',
+      confirm: true,
+      setup_future_usage: 'off_session',
+      execute_threed: true,
+      three_d_secure: {
+        version: '2.2.0',
+        eci: '02',
+        cavv: 'jJ81HADVRtXfCBATEp01CJUAAAA=',
+        ds_transaction_id: 'f879ea1c-aa2c-4441-806d-e30406466d79'
+      }
+    })
+
+    assert_success authorize_response
+    assert_equal 'requires_capture', authorize_response.params['status']
+    assert_not_empty authorize_response.params.dig('charges', 'data')[0]['payment_method_details']['card']['network_transaction_id']
+  end
+
+  def test_purchase_fails_with_incorrect_mit_exemption_combination
+    card_to_use = @three_ds_credit_card
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        network_transaction_id: '1098510912210968', # seems happy with any value :/
+        ds_transaction_id: 'null',
+        claim_without_transaction_id: true
+      }
+    })
+    assert_failure purchase
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        ds_transaction_id: 'null',
+        claim_without_transaction_id: true
+      }
+    })
+    assert_failure purchase
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        network_transaction_id: '1098510912210968', # seems happy with any value :/
+        claim_without_transaction_id: true
+      }
+    })
+    assert_failure purchase
+  end
+
+  def test_purchase_works_with_mit_exemption_network_id
+    card_to_use = @three_ds_off_session_credit_card
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        network_transaction_id: '1098510912210968', # seems happy with any value :/
+        ds_transaction_id: 'null' # this is not req
+      }
+    })
+
+    assert_success purchase
+    assert_equal 'succeeded', purchase.params['status']
+    assert purchase.params.dig('charges', 'data')[0]['captured']
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        network_transaction_id: '1098510912210968', # seems happy with any value :/
+      }
+    })
+
+    assert_success purchase
+    assert_equal 'succeeded', purchase.params['status']
+    assert purchase.params.dig('charges', 'data')[0]['captured']
+  end
+
+  def test_purchase_works_with_mit_exemption_for_grandfathered_cards_or_external_tx
+    card_to_use = @three_ds_off_session_credit_card
+
+    assert purchase = @gateway.purchase(@amount, card_to_use, {
+      currency: 'USD',
+      execute_threed: true,
+      confirm: true,
+      off_session: true,
+      mit: {
+        claim_without_transaction_id: true
+      }
+    })
+
+    assert_success purchase
+    assert_equal 'succeeded', purchase.params['status']
+    assert purchase.params.dig('charges', 'data')[0]['captured']
   end
 
   def test_purchase_fails_on_unexpected_3ds_initiation

@@ -8,17 +8,24 @@ class ConnexpayTest < Test::Unit::TestCase
 
     @options = {
       order_id: '1',
+      invoice: '123ABC',
       billing_address: address,
       description: 'Store Purchase'
     }
+
+    @logger = Logger.new(STDOUT)
   end
 
   def test_successful_purchase
-    response = @gateway.purchase(@amount, @credit_card, @options)
-    assert_success response
+    @logger.info("Ruby logging")
 
-    assert_equal 'Transaction - Approved', response.authorization
+    response = @gateway.purchase(@amount, @credit_card, @options)
+
+    assert_success response
     assert response.test?
+
+    @logger.info(response)
+
   end
 
   def test_failed_purchase
@@ -48,6 +55,10 @@ class ConnexpayTest < Test::Unit::TestCase
   end
 
   def test_successful_void
+    response = @gateway.purchase(@amount, @credit_card, @options)
+    assert_success response
+    assert_equal 'Transaction - Approved', response.authorization
+    assert response.test?
   end
 
   def test_failed_void

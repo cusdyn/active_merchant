@@ -1,15 +1,21 @@
 module ActiveMerchant #:nodoc:
   module Billing #:nodoc:
     class ConnexpayGateway < Gateway
+
+      SUCCESS = 'Transaction - Approved'
+
       self.test_url = 'https://salesapi.connexpaydev.com/api/v1'
       self.live_url = 'https://salesapi.connexpay.com/api/v1'
 
       self.supported_countries = ['US']
       self.default_currency = 'USD'
       self.supported_cardtypes = [:visa, :master, :american_express, :discover]
-
       self.homepage_url = 'http://www.connexpay.com/'
       self.display_name = 'ConnexPay'
+
+      # AM accepts/expects cents on the public method calls. For example $1.01 as 101.
+      # Connexpay expects $1.01 so this sets the proper money format
+      self.money_format = :dollars
 
       STANDARD_ERROR_CODE_MAPPING = {}
 
@@ -27,43 +33,29 @@ module ActiveMerchant #:nodoc:
         }
       end
 
-      def purchase(money, payment, options={})
-        post = {}
-        add_invoice(post, money, options)
-        add_customer_data(post, options)
 
+      # Purchase and Authorize are same
+      def purchase(money, payment, options={})
         post = create_post_for_auth_or_purchase(money, payment, options)
-        commit(:post, 'BasicSale', post)
+        commitAuthCapture(:post, 'BasicSale', post)
       end
 
       def authorize(money, payment, options={})
-        post = {}
-        add_invoice(post, money, options)
-        add_address(post, payment, options)
-        add_customer_data(post, options)
-
-        commit( :post, 'BasicAuth', post)
+        post = create_post_for_auth_or_purchase(money, payment, options)
+        commitAuthCapture(:post, 'BasicSale', post)
       end
 
       def create_post_for_auth_or_purchase(money, creditcard, options)
         post = {}
         post[:amount] = amount(money)
+
+        #ConnexPay Expected Payments=0 is required for aquiring-only
         post[:ConnexPayTransaction] = { ExpectedPayments: 0 }
+        add_orderinfo(post,options)
         add_creditcard(post,creditcard)
         add_risk_data(post, options)
         post
       end
-
-      def add_creditcard(post, creditcard)
-        # Map creditcard object to ConnexPay Card object
-          card = {
-            CardNumber: creditcard.number,
-            ExpirationDate: sprintf('%02d%02d', creditcard.year.to_s[-2, 2],creditcard.month),
-            cvv2: creditcard.verification_value
-          }
-          post[:card] = card
-      end
-
 
       def capture(money, authorization, options={})
         commit(:post, 'BasicCapture', post)
@@ -83,6 +75,25 @@ module ActiveMerchant #:nodoc:
           r.process(:ignore_result) { void(r.authorization, options) }
         end
       end
+
+      # map AM standard options to ConnexPay's order specificity info
+      def add_orderinfo(post,options)
+        # map AM field to ConnexPay order identifier fields
+        post[:OrderNumber]    = options[:invoice]
+        post[:SequenceNumber] = options[:OrderId]
+        post[:CustomerId]    = options[:description]
+      end
+
+      def add_creditcard(post, creditcard)
+        # Map creditcard object to ConnexPay Card object
+        card = {
+          CardNumber: creditcard.number,
+          ExpirationDate: sprintf('%02d%02d', creditcard.year.to_s[-2, 2],creditcard.month),
+          cvv2: creditcard.verification_value
+        }
+        post[:card] = card
+      end
+
 
       def supports_scrubbing?
         true
@@ -113,7 +124,7 @@ module ActiveMerchant #:nodoc:
           OrderNumber: options[:order_id],
           ProductType: options[:description],
           ProductPrice: post[:amount].to_f*100,
-          ProductItem: options[:order_id]
+          ProductItem: options[:invoice]
         }
 
         post[:RiskData] = risk
@@ -139,8 +150,53 @@ module ActiveMerchant #:nodoc:
                      (success ? response['status'] : response['status']),
                      response,
                      test: test?,
-                     authorization: response['status'])
+                     authorization: authorization_string(response['guid'],response['orderNumber']))
       end
+
+      def commitAuthCapture(action, resource, parameters)
+        response = http_request(action, resource, parameters)
+        success = !error?(response)
+
+        rsp = mapToOrbitalResponse(response)
+        successful = success?(response, resource)
+
+         Response.new(true,response_message(response['status']),rsp,
+                     {
+                       authorization: authorization_string(response['guid'],response['orderNumber']),
+                       cvv_result:   CVVResult.new(response['cvvVerificationCode']),
+                       avs_result:   AVSResult.new({:code=> response['addressVerificationCode']}),
+                       fraud_review: fraud_response(response['riskResponse']),
+                       test: self.test?
+                     })
+      end
+
+      def response_message(status)
+        strArray = status.split()
+        rsp = strArray[-1]
+        rsp
+      end
+
+      def fraud_response(rsp)
+        rtn = rsp
+        rtn[:provider] = "Kount"
+        rtn
+      end
+
+      def mapToOrbitalResponse(rin)
+        card = rin['card']
+        params = {}
+        rout = {}
+        #       params[:industry_type] = 'EC'
+        #params[:message_type]  = 'AC'
+        #params[:merchant_id] = rin['deviceGuid']
+        #params[:card_brand] = card['cardType']
+        #params[:status_msg] = rin['status']
+
+        #rout[:authorization] = rin[:status]
+        #rout[:params] = params
+        rout
+      end
+
 
       def success_from(response)
       end
@@ -184,6 +240,19 @@ module ActiveMerchant #:nodoc:
         response['error_code'] && !response['error_code'].blank?
       end
 
+      def authorization_string(*args)
+        args.compact.join(';')
+      end
+
+      def success?(response, message_type)
+        if message_type.include?"BasicSale"
+          response[:status].to_s.include?SUCCESS
+        else
+          false
+        end
+      end
     end
+
   end
 end
+
